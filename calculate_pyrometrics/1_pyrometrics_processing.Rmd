@@ -1,0 +1,395 @@
+---
+title: "image_registration_analysis"
+output: pdf_document
+date: "2023-02-13"
+---
+```{r}
+library(dplyr)
+library(ggplot2)
+library(hrbrthemes)
+#library(viridis)
+library(MetBrewer)
+library(raster)
+library(ggnewscale)
+library(sf)
+library(terra)
+library(magick)
+library(rgdal)
+library(gtools)
+library(animation)
+library(ggthemes)
+```
+
+
+
+
+
+Error vs time plot
+```{r}
+ggplot(data = error_geo, aes(x = frame, y = error, color = as.character(plot))) +
+  facet_wrap(~factor(burn), ncol = 2, strip.position = "top")+
+  geom_line(linewidth = 1)+
+  scale_color_manual(values = c(pallette[2], pallette[4], pallette[6], pallette[8]))+
+  scale_y_continuous(expand = c(0,0), limits = c(0, 5), breaks = seq(0, 5, by = 1)) +
+  ylab("shift (pixels)")+
+ theme_clean(base_size = 12)
+
+ggsave("ErrorLinePlot.pdf", last_plot(), path = "/Users/leo/Desktop/MS\ project/manuscript/figures", height = 5, width = 9)
+
+```
+
+
+
+```{r}
+output_wd <- "/Users/leo/Desktop/pyrometrics/output"
+setwd(output_wd)
+
+folder_path <-  "/Users/leo/Desktop/registration_results/WB/plot1/georeferenced"
+tiff_files <- list.files(folder_path,
+                         full.names = TRUE,
+                         pattern = ".TIFF$")
+
+
+
+filename_to_seconds <- function(file_path) {
+  # Extract the filename without extension
+  time_str <- gsub(".*IRX_(\\d{6})_geo\\.TIFF$", "\\1", file_path)
+  # Extract hours, minutes, and seconds
+  hours <- as.numeric(substr(time_str, 1, 2))
+  minutes <- as.numeric(substr(time_str, 3, 4))
+  seconds <- as.numeric(substr(time_str, 5, 6))
+  # Convert to seconds
+  total_seconds <- (hours * 3600) + (minutes * 60) + (seconds)
+  return(total_seconds)
+}
+seconds <- as.numeric(lapply(tiff_files, filename_to_seconds))
+seconds <- seconds - min(seconds)
+seconds_diff <- c(0, diff(seconds))
+
+reference_raster <- rast(paste0(tiff_files[1]), lyrs = 2) %>%
+  terra::rectify() %>%
+  classify(cbind(-Inf, 1, NA), right=FALSE)
+plot(reference_raster)
+
+rect_rast <- vector("list", length(tiff_files))
+rect_rast1 <- vector("list", length(tiff_files))
+  
+start_time <- Sys.time()
+for (file in 1:length(tiff_files)) {
+  raster <- suppressWarnings(rast(tiff_files[file], lyrs = 2))
+  print(tiff_files[file])
+    # Step 1a: Set pixel values of 0 to NA
+  rect <- terra::rectify(raster)
+  rect <- classify(rect, cbind(-Inf, 1, NA), right=FALSE)
+  #rast <- raster(rect)
+  #rast <- raster::resample(rast, reference_raster)
+  rast <- terra::resample(rect, reference_raster)
+  rect_rast[[file]] <- rast
+  #rect_rast1[[file]] <- raster::trim(rast,  values = NA)
+  rect_rast1[[file]] <- terra::trim(rast,  value = NA)
+}
+end_time <- Sys.time()
+execution_time <- end_time - start_time
+print(paste("Total Execution Time:", execution_time))
+
+plot(rect_rast[[100]])
+
+
+extents <- lapply(rect_rast1, terra::ext)
+
+# Get the maximum and minimum values for each extent dimension
+xmin_values <- round(max(sapply(extents, xmin)),1)# +1
+ymin_values <- round(max(sapply(extents, ymin)),1)# +1
+xmax_values <- round(min(sapply(extents, xmax)),1)# -1
+ymax_values <- round(min(sapply(extents, ymax)),1)# -1
+
+# Calculate the combined extent
+common_extent <- extent(xmin_values, xmax_values, ymin_values, ymax_values)
+
+rect_rast2 <- list()
+# Step 3: Clip each TIFF to the smallest extent and mask NA values
+for (file in 1:length(rect_rast)) {
+  rect_rast2[[file]] <- terra::crop(rect_rast[[file]], common_extent)
+}
+
+
+plot(rect_rast2[[1]])
+
+raster_stack <- c(rect_rast2)
+rm(rect_rast, rect_rast1, rect_rast2)
+gc()
+raster_stack <- rast(raster_stack)
+nlyr(raster_stack)
+plot(raster_stack[[140]])
+tiff_files[1948]
+
+
+plot(raster_stack[[100]], range = c(0,500))
+
+pdf(paste0(output_wd,"/WBplot1600.pdf"), width = 5, height = 5)
+plot(raster_stack[[1948]], col = met.brewer(name = "Tam", n = 10, direction = -1), breaks = seq(0,500,50), main = "CHANGE TITLE", type = "continuous", plg = list(title = "Temp (c)"))
+dev.off()
+
+
+ani.options(ani.width = 600, ani.height = 600)
+saveGIF({
+  for(i in 1:nlyr(raster_stack)) {
+    plot(raster_stack[[i]], col = met.brewer(name = "Tam", n = 100, direction = -1), breaks = seq(0,600,50), main = "Calibration Burn", type = "continuous", plg = list(title = "Temp (c)"))
+  }
+}, movie.name = paste0(output_wd,"/raster_stack_CAL.gif"), interval = 0.03, clean = TRUE)
+
+plot(rect_rast[[866]])
+plot(rect_rast1[[866]])
+```
+
+
+
+FRED
+```{r}
+output_wd <- "/Users/leo/Desktop/registration_results"
+setwd(output_wd)
+
+
+#FRFD=o(Tf^4-Tb^4)
+#o=5.67*10^-8 W m-2 K-4
+#Temp needs to be in Kelvin
+#thus: need to determine background temperature for each image...., find the peak? How about round temperatures and find the mode?
+
+
+#temp_stack_rounded <- round(raster_stack,digits = -1) + 270
+#temp_stack_rounded <- raster_stack + 273.15
+
+#if(define_background_temp == TRUE){
+#  mode_temps <- data.frame()
+#  for(x in 1:nlyr(temp_stack_rounded)){
+#    temp <- na.omit(as.data.frame(temp_stack_rounded[[x]]))[,1]
+#    temp_10 <- quantile(temp, .10)
+#    temp_mode <- getmode(temp)
+#    mode_temps <- rbind(mode_temps,temp_mode)
+#    print(c(temp_mode, temp_10, x))
+#  }
+#  }
+temp_stack_K <- raster_stack + 273.15
+
+temp <- values(temp_stack_K, na.rm = TRUE)
+
+percentiles <- apply(temp, 2, function(col) {
+  quantile(col, probs = 0.1)
+}) %>%
+  as.numeric() 
+
+
+tf4_tb4 <- (temp_stack_K^4) - (percentiles^4)
+tf4_tb4[tf4_tb4<0]<-0
+#plot(tf4_tb4[[100]])
+
+
+#for(i in 2:nlyr(temp_stack_K)){
+#   temp <- (temp_stack_K[[i]])^4 - (percentiles[i])^4 
+#   temp[temp<0]<-0
+#   tf4_tb4 <- c(tf4_tb4,temp)
+#   print(i)
+#}
+
+FRFD <- tf4_tb4 * (5.67*10^-8)*0.98 #what are the units? W/m2, Hudak Cooney Ridge paper equation
+#plot(FRFD[[5]])
+
+writeRaster(FRFD,paste0(output_wd,'/FRFD_stack.tif'), overwrite=TRUE)
+FRFD <- rast("/Users/leo/Desktop/registration_results/HH/plot1/FRFD_stack.tif")
+
+#mask pixels with no flaming combustion, <1,070 W/m2 (Hudak 2016)
+MaxFRFD <- max(FRFD)
+MaskFRFD <- ifel(MaxFRFD < 1070, NA, 1)
+plot(MaskFRFD)
+MaskFRFD <- mask(FRFD, MaskFRFD)
+plot(MaskFRFD[[50]])
+```
+
+
+```{r}
+#data table for plot temporal stats
+PixelArea <- res(MaskFRFD)[1] * res(MaskFRFD)[2]
+temp <- values(MaskFRFD, na.rm = TRUE)
+
+sum_pixels <- apply(temp, 2, function(col) {
+  sum(col)
+}) %>%
+  as.numeric()
+
+energy <- data.frame(Frame = c(1:nlyr(MaskFRFD)), Time = seconds, area = expanse(MaskFRFD)[2], Sum = sum_pixels)
+energy$Watts <- energy$Sum/energy$area*PixelArea
+plot(energy$Time, energy$Watts, xlab = "seconds", ylab = "Watts")
+
+
+
+## Rate of area spread ##
+threshold <- 1070 # adjust as necessary
+FirstOccurrence <- terra::which.max(MaskFRFD >= threshold)
+plot(FirstOccurrence)
+
+RosArea <- values(FirstOccurrence) %>%
+  table() %>%
+  as.data.frame()
+
+RosArea$Time <- seconds[as.numeric(as.character(RosArea$.))+1]
+RosArea$Area <- RosArea$Freq*PixelArea
+RosArea$RosArea <- (RosArea$Area)/5
+
+plot(RosArea$Time, RosArea$RosArea)
+
+hist(RosArea$RosArea)
+
+
+#combine tables, save
+Pyromet <- merge(energy, RosArea[, c("Time", "RosArea")], by = "Time", all.x = TRUE)
+
+write.csv(Pyromet, file = paste0(output_wd,'/energy_table.csv'))
+```
+
+
+```{r}
+#old summing method
+#FRED <- sum(FRFD[[1:10]])*mean(seconds_diff)/1000 #w/m^2 to kJ/m^2
+
+#new integration method using arrays
+trapezoidal_integration <- function(y_values, x_values) {
+  areas <- 0.5 * diff(x_values) * (y_values[-length(y_values)] + y_values[-1])
+  sum(areas)
+}
+
+array_data <- as.array(MaskFRFD)
+# Compute the integral for each pixel across all layers using trapezoidal integration
+result_array <- apply(array_data, c(1, 2), function(pixel_values) {
+  trapezoidal_integration(pixel_values, seconds)
+})
+#preserve geotransform
+FRED <- rast(MaskFRFD, 1)
+values(FRED) <- matrix(result_array, ncol=ncol(FRED), nrow=nrow(FRED))
+
+FRED <- FRED/1e6 #since we integrated power over time, we now have energy in J, convert to Mj/m^2
+
+#for(x in 2:nlayers(FRFD)){
+#   FRED <- FRED+(FRFD[[x]]*image_timestep/1000) #units???? kJ/m^2
+#}
+plot(FRED, col = met.brewer(name = "VanGogh2", n = 10, direction = -1))
+writeRaster(FRED, paste0(output_wd,'/FRED.tiff'), overwrite=TRUE)
+
+
+WC <- 0.059
+
+pred_fuel_consumption <- FRED/(3.025-(5.32*WC)) #units in kg/m2
+#pred_fuel_consumption <- FRED/.17/20.86 # rf = 17% and hc = 20.86 Mj/kg
+
+
+#remove NA values, optional
+#pred_fuel_consumption <- ifel(is.na(pred_fuel_consumption), 0, pred_fuel_consumption)
+#FREDNA <- ifel(is.na(FRED), 0, FRED)
+
+plot(pred_fuel_consumption, col = met.brewer(name = "VanGogh2", n = 10, direction = -1), main = "Consumption", type = "continuous", plg = list(title = "kg/m^2"))
+
+writeRaster(pred_fuel_consumption, paste0(output_wd,'/fuel_consumption.tiff'), overwrite=TRUE)
+
+
+## Code to account for uncaptured energy release
+burn <- "WB"; plot <- 4
+pred_fuel_consumption <- rast(sprintf("/Users/leo/Desktop/registration_results/%s/plot%s/fuel_consumption.tiff", burn, plot))
+
+#HH1 0.01930898
+#HH2 0.01350583
+#HD1 0.2861781
+#HD2 0.2803679
+#WB1 2.570762
+#WB2 0.5485604
+#WB3 0.1854986
+#WB4 0.1444367
+
+mean(values(pred_fuel_consumption, na.rm = TRUE))
+
+pred_fuel_consumption <- pred_fuel_consumption*(1+ 0.1444367)
+
+writeRaster(pred_fuel_consumption, sprintf("/Users/leo/Desktop/registration_results/%s/plot%s/fuel_consumption.tiff", burn, plot), overwrite=TRUE)
+```
+
+
+```{r}
+burn <- "HH"
+plot <- 1
+
+output_wd <- sprintf("/Users/leo/Desktop/registration_results/%s/plot%s/", burn, plot)
+setwd(output_wd)
+FRFD <- rast(sprintf("/Users/leo/Desktop/registration_results/%s/plot%s/FRFD_stack.tif", burn, plot))
+
+LayerToSeconds <- function(layers) {
+  # Extract the filename without extension
+  time <- gsub("IRX_(\\d{6})_geo_2", "\\1", layers)
+  # Extract hours, minutes, and seconds
+  hr <- as.numeric(substr(time, 1, 2))
+  min <- as.numeric(substr(time, 3, 4))
+  sec <- as.numeric(substr(time, 5, 6))
+  # Convert to seconds
+  totalseconds <- (hr * 3600) + (min * 60) + (sec)
+  return(totalseconds)
+}
+
+seconds <- as.numeric(lapply(names(FRFD), LayerToSeconds))
+seconds <- seconds - min(seconds)
+seconds_diff <- c(0, diff(seconds))
+
+#mask pixels with no flaming combustion, <1,070 W/m2 (Hudak 2016)
+MaxFRFD <- max(FRFD, na.rm = TRUE)
+MaskFRFD <- ifel(MaxFRFD < 1070, NA, 1)
+plot(MaskFRFD)
+MaskFRFD <- mask(FRFD, MaskFRFD)
+
+threshold <- 1070 # adjust as necessary
+FirstOccurrence <- terra::which.max(MaskFRFD >= threshold)
+```
+
+
+
+ROS testing
+```{r}
+
+#converting frames to seconds
+FirstOccurSec <- FirstOccurrence
+values(FirstOccurSec) <- seconds[values(FirstOccurrence)]
+#messing with res
+#template <- terra::rast(extent = (FirstOccurSec), resolution = 1)
+#FirstOccurSec <- resample(FirstOccurSec, template, method = "bilinear")
+plot(FirstOccurSec)
+
+Slope <- terrain(FirstOccurSec, "slope", 4, "radians")
+plot(Slope)
+density(Slope)
+
+#Ros in meters/min given raster is meter scale
+Ros <- (1/tan(Slope))*60
+#to preserve Na values while removing 'anomalies'
+RosNA <- Ros
+Ros[Ros >= 30] <- NA
+density(Ros)
+plot(Ros)
+#interp between values
+pts <- as.points(Ros, values=TRUE, na.rm = TRUE)
+
+# Perform IDW interpolation
+RosInterp <- interpIDW(Ros, pts[pts$slope != -999,], field = "slope", radius = 2, power = 2, smooth = 1, maxPoints = 20)
+RosInterp[is.na(RosNA)] <- NA
+# Check results
+plot(RosInterp)
+hist(RosInterp)
+mean(values(RosInterp, na.rm = TRUE))
+
+
+#writeRaster(FirstOccurSec, paste0(output_wd, "LeoArrivalSeconds.tiff"), overwrite=TRUE)
+#writeRaster(RosInterp, sprintf("/Users/leo/Desktop/registration_results/RosRasters/Ros%s%s.tiff", burn, plot), overwrite=TRUE)
+
+Rast <- rast("/Users/leo/Desktop/registration_results/HH/plot1/ROS.tiff")
+RastNA <-  ifel(is.na(Rast), 0, Rast)
+
+pdf(paste0(output_wd,"/HH1Ros.pdf"), width = 4, height = 4)
+plot(RastNA, col = met.brewer(name = "OKeeffe2", n = 8, direction = 1), breaks = seq(0,4,1), main = "Rate of Spread", type = "continuous", plg = list(title = "m/min"))
+dev.off()
+```
+
+

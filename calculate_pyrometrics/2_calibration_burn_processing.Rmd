@@ -1,0 +1,155 @@
+---
+title: "CalibrationBurn"
+output: pdf_document
+date: "2023-09-20"
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(terra)
+library(MetBrewer)
+library(data.table)
+library(ggthemes)
+library(hrbrthemes)
+library(lmodel2)
+```
+
+
+#Load FRE stack, polygons
+```{r}
+Consum <- rast("/Users/leo/Desktop/registration_results/CAL/fuel_consumption.tiff")
+FRED <- rast("/Users/leo/Desktop/registration_results/CAL/FRED.tiff")
+plot(Consum)
+
+radius <- 1.5
+CalPlots <- read.csv("/Users/leo/Desktop/registration_results/CAL/PlotCenterCoords.csv") %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 26912) %>%
+  st_buffer(dist = radius) %>%
+  data.table()
+plot(CalPlots$geometry, col = NA, border = "red", lwd = 2)
+
+plot(FRED, col = met.brewer(name = "VanGogh2", n = 10, direction = -1), breaks = seq(0,200,5), main = "Consumption", type = "continuous", plg = list(title = "kg/m^2"))
+plot(CalPlots$geometry, add = TRUE, col = NA, border = "red", lwd = 2)
+
+
+# extract, weight by resolution, aggregate
+ConsumPlot <- terra::extract(Consum, vect(CalPlots$geometry), fun=NULL, na.rm = TRUE) %>%
+  data.table()
+FREDPlot <- terra::extract(FRED, vect(CalPlots$geometry), fun=NULL) %>%
+  data.table()
+FREDPlot$ID <- as.factor(FREDPlot$ID)
+PixelArea <- res(Consum)[1] * res(Consum)[2]
+
+
+PlotSum <- FREDPlot[, .(FRED = sum(lyr1)*PixelArea), by = ID]
+PlotSum$Observed = c(2.14, 4.30, 7.00, 7.49, 9.64, 12.26, 12.7, 14.67, 17.50, 19.07)
+PlotSum$ConsumKremens <- ConsumPlot[, .(Consumkg = sum(lyr1)*PixelArea), by = ID][,2] #Used for paper
+#PlotSum$ConsumKremens <- ConsumPlot[, .(FRED = (sum(lyr1)*PixelArea)/(0.17/20.86)), by = ID][,2]
+PlotSum$ConsumSmith <- FREDPlot[, .(FRED = sum(lyr1)*PixelArea/(3.025-(5.32*.1))), by = ID][,2]
+PlotSum$Wooster2005 <- FREDPlot[, .(FRED = sum(lyr1)*PixelArea*0.368), by = ID][,2]
+PlotSum$Freeborn2008 <- FREDPlot[, .(FRED = sum(lyr1)*PixelArea*0.453), by = ID][,2]
+```
+
+
+# Scatter plot
+```{r}
+pallette = met.brewer(name = "Degas", n = 10, type = "continuous")
+
+ggplot(data = PlotSum) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed", size = 0.7) +
+  geom_abline(slope = 1.1, intercept = -0.338, color = pallette[8], linetype = "solid", linewidth = 0.7, alpha = 0.5) +
+  geom_abline(slope = 0.773, intercept = -0.238, color = pallette[2], linetype = "solid", linewidth = 0.7, alpha = 0.5) +
+  geom_point(aes(Observed, ConsumKremens, fill = 'Hudak, 2016'), size = 4, shape = 24) +
+  geom_point(aes(Observed, ConsumSmith, fill = 'Smith, 2013'), size = 4, shape = 21) +
+  #geom_point(aes(Observed, Wooster2005, fill = 'Wooster, 2005'), size = 4, shape = 22) +
+  #geom_point(aes(Observed, Freeborn2008, fill = 'Freeborn, 2008'), size = 4, shape = 23) +
+  scale_fill_manual(values = pallette[c(2,8)]) + #used in paper
+  #scale_fill_manual(values = pallette[c(2,8,4,10)]) +
+  coord_fixed(ratio = 1) +
+  scale_x_continuous(expand = c(0,0), limits = c(0, 25), breaks = seq(0, 25, by = 5)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 25), breaks = seq(5, 25, by = 5)) +
+  labs(
+    x = expression("Observed Consumption (kg/m"^2*")"),
+    y = expression("Predicted Consumption (kg/m"^2*")")
+  ) +
+  #theme_clean(base_size = 16)+ #paper
+  theme_clean(base_size = 10)+
+  theme(
+    legend.background = element_blank(),
+    legend.position = c(.77, .11), #used in paper
+    #legend.position = c(1, .16),
+    legend.justification = c("left", "bottom"),
+    legend.title = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = unit(c(.5,.5,.5,.5), "cm")
+  ) 
+  #annotate("text", x = 24, y = 21, label = "1:1 line", color = "red", hjust = 1, size = 12/.pt)
+
+ggsave('ConsumptionPoint.pdf', last_plot(), height = 5, width = 5, units = "in", path = "/Users/leo/Desktop/MS\ project/manuscript/figures")
+```
+
+
+
+#Density Plot
+```{r}
+ggplot() +
+  geom_density(data = FREDPlot[ID %in% 2:9], aes(lyr1, group=ID), adjust = 350, fill = "transparent") +
+  geom_density(data = FREDPlot[ID == 1], aes(lyr1, fill = "Plot 1"), adjust = 350, alpha = 0.7) +
+  geom_density(data = FREDPlot[ID == 10], aes(lyr1, fill = "Plot 10"), adjust = 350, alpha = 0.7) +
+  scale_fill_manual(values = c("Plot 1" = pallette[4], "Plot 10" = pallette[6])) +
+  scale_x_continuous(expand = c(0,0), limits = c(0, 175), breaks = seq(0, 150, by = 50)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 0.05), breaks = seq(.01, .06, by = .01)) +
+  labs(
+    x = expression("FRED (Mj/m"^2*")"),
+    y = "Density"
+  ) +
+  theme_clean(base_size = 16)+
+  theme(
+    legend.background = element_blank(),
+    legend.position = c(.85, .2),
+    #legend.justification = c("left", "bottom"),
+    legend.title = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = unit(c(.5,.5,.5,.5), "cm")
+  )
+
+ggsave('FredDensity.pdf', last_plot(), height = 4, width = 7, units = "in", path = "/Users/leo/Desktop/MS\ project/manuscript/figures")
+
+
+
+```
+
+# Stats
+
+```{r}
+ConsumLm <- lm(Observed ~ ConsumSmith, data = PlotSum)
+ConsumLm1 <- lm(Observed ~ offset(1*ConsumSmith), data = PlotSum)
+summary(ConsumLm)
+anova(ConsumLm1, ConsumLm)
+
+
+ConsumLm2 <- lm(Observed ~ ConsumKremens, data = PlotSum)
+#ConsumLm2 <- lm(ConsumKremens ~ Observed, data = PlotSum)
+ConsumLm3 <- lm(Observed ~ offset(1*ConsumKremens), data = PlotSum)
+summary(ConsumLm2)
+anova(ConsumLm3, ConsumLm2)
+
+t.test(PlotSum$Observed, PlotSum$ConsumSmith, paired = TRUE, alternative = "two.sided")
+
+sqrt(mean(ConsumLm$residuals^2))
+
+plot(ConsumLm)
+
+#RMSE based on 1:1 line
+
+Ortho <- (PlotSum$ConsumSmith - PlotSum$Observed) / sqrt(2)
+sqrt(mean(Ortho^2))
+mean(Ortho)
+
+
+```
+
+
+

@@ -1,0 +1,113 @@
+---
+title: "PyroGif"
+output: pdf_document
+date: "2023-11-06"
+---
+
+Spatiotemporal FRP animation
+```{r}
+library(dplyr)
+library(ggplot2)
+library(terra)
+library(MetBrewer)
+library(data.table)
+library(ggthemes)
+library(hrbrthemes)
+library(animation)
+library(patchwork)
+library(ggspatial)
+library(gridExtra)
+```
+
+```{r}
+Plots <- data.table(Burn = c("HH", "HH","HD","HD","WB","WB","WB","WB"), Plot = c(1,2,1,2,1,2,3,4))
+PyroTemporal <- data.table()
+
+
+# Loop through each row in the Plots data table
+{
+  for (i in 1:nrow(Plots)) {
+    burn <- Plots$Burn[i]
+    plot <- Plots$Plot[i]
+    pyrotemporalPlot <- read.csv(sprintf("/Users/leo/Desktop/registration_results/%s/plot%s/energy_table%s%s.csv", burn, plot, burn, plot)) %>%
+      as.data.table()
+    pyrotemporalPlot[,Burn := burn][, Plot := plot][, BP := paste0(burn, plot)][, X:=NULL][, TimeMin := Time/60]
+    PyroTemporal <- rbind(PyroTemporal, pyrotemporalPlot)
+  }
+  rm(burn, plot, pyrotemporalPlot)
+}
+```
+
+
+```{r}
+Rx <- "Wildbill Rx"
+Burn <- "WB"
+Plot <- 4
+
+
+save_animation <- function(rx, burn, plot) {
+  palette <- met.brewer("Tam", direction = -1)
+  frpTime <- PyroTemporal[BP == paste0(burn, plot)]
+  
+  frpStack <- rast(sprintf("/Users/leo/Desktop/registration_results/%s/plot%s/FRFD_stack%s%s.tif", burn, plot, burn, plot))
+  names(frpStack) <- rep("layer", nlyr(frpStack))
+  template <- rast(extent = frpStack, resolution = .2)
+  frpStackResamp <- resample(frpStack, template, method = "bilinear")
+  print("data loaded")
+  
+  for (i in 1:nlyr(frpStack)) {
+    print(paste0("frame ", i, " of ", nlyr(frpStack)))
+    time <- frpTime[Frame == i]$TimeMin
+    hours <- floor(time / 60)
+    minutes <- round(time %% 60)
+    timeString <- sprintf("%02d:%02d", hours, minutes)
+    
+    raster <- as.data.frame(frpStackResamp[[i]], xy = TRUE)
+    raster$layerexp <- raster$layer^0.5
+    raster$layerexp[raster$layerexp > 50] <- 50
+
+    # Create the raster plot
+    rast <- ggplot() +
+      geom_raster(data = raster, aes(x = x, y = y, fill = layerexp), show.legend = FALSE) +
+      scale_fill_gradientn(colors = palette, limits = c(0,50))+
+      annotation_scale(plot_unit = "m", width_hint = .5, pad_x = unit(0.5, "cm"), pad_y = unit(-0.5, "cm"), text_cex = 1)+
+      coord_equal(clip = "off")+
+      theme_void(base_size = 16)+
+      labs(title = paste0(rx, " Plot", plot), subtitle = paste0("Time elapsed (hr:min): ", timeString))+
+      theme(
+        panel.background = element_rect(fill = palette[1], color = NA),
+        plot.margin = unit(c(0, 0, 0.5, 0), "cm"),
+        plot.title = element_text(size = 24),
+        plot.subtitle = element_text(size = 20, color = "red")
+      )
+
+    # Create the line plot
+    line <- ggplot(frpTime, aes(x = TimeMin, y = Watts)) +
+      geom_area(fill = "grey", alpha = 0.7) +
+      geom_line(color = "black", linewidth = 0.6) +
+      geom_area(data = subset(frpTime, Frame >= 0 & Frame <= i), aes(x = TimeMin, y = Watts), fill = "#800000", alpha = 0.7) +
+      geom_point(data = subset(frpTime, Frame == i), aes(x = TimeMin, y = Watts), color = "black", size = 5) +
+      theme_minimal(base_size = 16) +
+      xlab("Duration (min)")+
+      ylab(expression(FRP ~ (W ~ m^-2)))+
+      theme(legend.position = "none",
+            plot.margin = unit(c(0, 1, 0.5, 1), "cm"))
+    
+    # Combine the plots
+    combined_plot <- rast / line + plot_layout(heights = c(4, 1))
+    
+    plot(combined_plot)
+    
+    # Save the current frame
+    #animation::ani.pause()  # This pauses the plot for a moment (necessary for the save)
+    
+  }
+}
+
+
+animation::saveGIF(save_animation(Rx, Burn, Plot), movie.name = sprintf("/Users/leo/Desktop/registration_results/animated_visualization%s%s.gif", Burn, Plot), ani.width = 600, ani.height = 825, interval = 0.03, clean = TRUE)
+
+gc()
+```
+
+

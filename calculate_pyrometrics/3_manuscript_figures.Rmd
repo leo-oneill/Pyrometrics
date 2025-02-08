@@ -1,0 +1,609 @@
+---
+title: "Visualizations for manuscript"
+output: pdf_document
+date: "2023-10-03"
+---
+Packages
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(terra)
+library(raster)
+library(MetBrewer)
+library(data.table)
+library(ggthemes)
+library(hrbrthemes)
+library(pracma)
+library(dunn.test)
+library(gstat)
+library(animation)
+library(patchwork)
+library(ggspatial)
+library(gridExtra)
+```
+
+Temporal pyrometric aggregation
+```{r}
+Plots <- data.table(Burn = c("HH", "HH","HD","HD","WB","WB","WB","WB"), Plot = c(1,2,1,2,1,2,3,4))
+PyroTemporal <- data.table()
+
+
+# Loop through each row in the Plots data table
+{
+  for (i in 1:nrow(Plots)) {
+    burn <- Plots$Burn[i]
+    plot <- Plots$Plot[i]
+    pyrotemporalPlot <- read.csv(sprintf("/Users/leo/Desktop/registration_results/%s/plot%s/energy_table%s%s.csv", burn, plot, burn, plot)) %>%
+      as.data.table()
+    pyrotemporalPlot[,Burn := burn][, Plot := plot][, BP := paste0(burn, plot)][, X:=NULL][, TimeMin := Time/60]
+    PyroTemporal <- rbind(PyroTemporal, pyrotemporalPlot)
+  }
+  rm(burn, plot, pyrotemporalPlot)
+}
+
+
+
+# Initialize lists to store the models and predictions
+LmFits <- list()
+Frefactor <- list()
+PyroPrediction <- data.table(Burn = character(), Plot = numeric(), Time = numeric(), TimeMin = numeric(), Watts = numeric(), Type = character(), BP = character())
+
+# Loop through each unique Burn/Plot combination
+{for (i in 1:nrow(Plots)) {
+  burn <- Plots$Burn[i]
+  plot <- Plots$Plot[i]
+  current_data <- PyroTemporal[Burn == burn & Plot == plot]
+  subset_data <- current_data[Time > current_data[which.max(Watts), Time]]
+  # Fit a linear model
+  #lm_fit <- nls(Watts ~ 0 +(initial_Watts) * exp(-k * Time), data = subset_data, start = list(initial_Watts = max(subset_data$Watts), k = 1e-03), control = nls.control(maxiter = 100))
+  lm_fit <- lm(log(Watts) ~ Time, data = subset_data)
+  LmFits[[paste0(burn, plot)]] <- lm_fit
+  # Use the model to make predictions
+  extinction_time <- coef(lm_fit)[1]/-coef(lm_fit)[2]
+  predict_data <- data.table(Time = seq(current_data[which.max(Watts), Time], extinction_time, by = 60))
+  predict_data[, TimeMin := Time/60][, Burn := burn][, Plot := plot]
+  predict_data[, Watts := exp(predict(lm_fit, newdata = .SD))]
+  predict_data[, Type := ifelse(Time <= max(current_data$Time), 'combo', 'predict')]
+  predict_data[, BP := paste0(burn, plot)]
+  # Append predictions to the predictions data table
+  PyroPrediction <- rbind(PyroPrediction, predict_data)
+  #FRE factor
+  fredfact <- (trapz(predict_data[predict_data$Time > max(current_data$Time)]$Time, predict_data[predict_data$Time > max(current_data$Time)]$Watts))/(trapz(current_data$Time, current_data$Watts))
+  Frefactor[[paste(burn, plot)]] <- fredfact
+}
+  rm(burn, plot, current_data, subset_data, lm_fit, extinction_time, predict_data, fredfact)
+  }
+
+```
+Spatial pyrometric aggregation
+```{r}
+LayerToSeconds <- function(layers) {
+  # Extract the filename without extension
+  time <- gsub("IRX_(\\d{6})_geo_2", "\\1", layers)
+  # Extract hours, minutes, and seconds
+  hr <- as.numeric(substr(time, 1, 2))
+  min <- as.numeric(substr(time, 3, 4))
+  sec <- as.numeric(substr(time, 5, 6))
+  # Convert to seconds
+  totalseconds <- (hr * 3600) + (min * 60) + (sec)
+  return(totalseconds)
+}
+
+GetRasterConsum <- function(burn, plot) {
+  # Construct the filename
+  filename <- sprintf("/Users/leo/Desktop/registration_results/%s/plot%s/fuel_consumption%s%s.tiff", burn, plot, burn, plot)
+  # Load the raster
+  rast <- rast(filename)
+  #rastAggr <- terra::aggregate(rast, 22, fun = "mean", na.rm = TRUE)
+  template <- rast(extent = rast, resolution = 4.6)
+  rastAggr <- resample(rast, template, method = "bilinear")
+  # Extract the pixel values
+  consum <- values(rast, na.rm = TRUE)
+  consumAggr <- values(rastAggr, na.rm = TRUE)
+  # Create a data.table with the values
+  dt <- data.table(Burn = burn, Plot = plot, Consum = consum)
+  dtAggr <- data.table(Burn = burn, Plot = plot, Consum = consumAggr)
+  return(list(dt = dt, dtAggr = dtAggr))
+}
+
+GetRasterRos <- function(burn, plot) {
+  # Construct the filename
+  filename <- sprintf("/Users/leo/Desktop/registration_results/%s/plot%s/ROS%s%s.tiff", burn, plot, burn, plot)
+  # Load the raster
+  rast <- rast(filename)
+  #rastAggr <- terra::aggregate(rast, 22, fun = "mean", na.rm = TRUE)
+  template <- rast(extent = rast, resolution = 4.6)
+  rastAggr <- resample(rast, template, method = "bilinear")
+  # Extract the pixel values
+  ros <- values(rast, na.rm = TRUE)
+  rosAggr <- values(rastAggr, na.rm = TRUE)
+  # Create a data.table with the values
+  dt <- data.table(Burn = burn, Plot = plot, ROS = ros)
+  dtAggr <- data.table(Burn = burn, Plot = plot, ROS = rosAggr)
+  return(list(dt = dt, dtAggr = dtAggr))
+}
+
+GetResidenceTime <- function(burn, plot) {
+  filepath <- sprintf("/Users/leo/Desktop/registration_results/%s/plot%s/ResTime%s%s.tif", burn, plot, burn, plot)
+  #FRFD <- rast(filepath)
+  #seconds <- as.numeric(lapply(names(FRFD), LayerToSeconds))
+  #seconds <- seconds - min(seconds)
+  #secondsDiff <- c(0, diff(seconds))
+  #residenceTimeRast <- sum(app(FRFD, function(layer) ifelse(layer > 6120, 1, NA)) * secondsDiff, na.rm = TRUE)
+  #writeRaster(residenceTimeRast, sprintf("/Users/leo/Desktop/registration_results/%s/plot%s/ResTime%s%s.tif", burn, plot, burn, plot))
+  residenceTimeRast <- rast(filepath)
+  template <- rast(extent = residenceTimeRast, resolution = 4.6)
+  residenceTimeRastAggr <- resample(residenceTimeRast, template, method = "bilinear")
+  resTime <- values(residenceTimeRast, na.rm = TRUE)
+  resTimeAggr <- values(residenceTimeRastAggr, na.rm = TRUE)
+  dt <- data.table(Burn = burn, Plot = plot, ResTime = resTime)
+  dtAggr <- data.table(Burn = burn, Plot = plot, ResTime = resTimeAggr)
+  return(list(dt = dt, dtAggr = dtAggr))
+}
+
+
+
+#ConsumptionDT <- data.table(Burn=character(), Plot=numeric(), Consum.lyr1=numeric()); ConsumptionDTAggr <- data.table(Burn=character(), Plot=numeric(), Consum.lyr1=numeric())
+#RosDT <- data.table(Burn=character(), Plot=numeric(), ROS.slope=numeric()); RosDTAggr <- data.table(Burn=character(), Plot=numeric(), ROS.slope=numeric())
+#ResTimeDT <- data.table(Burn=character(), Plot=numeric(), ResTime.sum=numeric()); ResTimeDTAggr <- data.table(Burn=character(), Plot=numeric(), ResTime.sum=numeric())
+
+Plots <- data.table(Burn = c("HH", "HH","HD","HD","WB","WB","WB","WB"), Plot = c(1,2,1,2,1,2,3,4))
+
+for(i in 1:nrow(Plots)) {
+  Consum <- GetRasterConsum(Plots$Burn[i], Plots$Plot[i]); ConsumptionDT <- rbind(ConsumptionDT, Consum$dt); ConsumptionDTAggr <- rbind(ConsumptionDTAggr, Consum$dtAggr)
+  Ros <- GetRasterRos(Plots$Burn[i], Plots$Plot[i]); RosDT <- rbind(RosDT, Ros$dt); RosDTAggr <- rbind(RosDTAggr, Ros$dtAggr)
+  ResTime <- GetResidenceTime(Plots$Burn[i], Plots$Plot[i]); ResTimeDT <- rbind(ResTimeDT, ResTime$dt); ResTimeDTAggr <- rbind(ResTimeDTAggr, ResTime$dtAggr)
+}
+
+
+
+
+# Add the values to the ConsumptionDT data.table
+setnames(ConsumptionDT, "Consum.lyr1", "ConsumptionKg"); setnames(ConsumptionDTAggr, "Consum.lyr1", "ConsumptionKg")
+setnames(RosDT, "ROS.slope", "Ros"); setnames(RosDTAggr, "ROS.slope", "Ros")
+setnames(ResTimeDT, "ResTime.sum", "ResTime"); setnames(ResTimeDTAggr, "ResTime.sum", "ResTime")
+ConsumptionDT[,ConsumptionMg := ConsumptionKg*10]; ConsumptionDTAggr[,ConsumptionMg := ConsumptionKg*10]
+ResTimeDT[,ResTimeMin := ResTime/60]; ResTimeDTAggr[,ResTimeMin := ResTime/60]
+
+```
+FRP time Plot
+```{r}
+PyroTemporal$BP = factor(PyroTemporal$BP, levels = c("HH1", "HH2", "HD1", "HD2", "WB1", "WB2", "WB3", "WB4"))
+PyroPrediction$BP = factor(PyroPrediction$BP, levels = c("HH1", "HH2", "HD1", "HD2", "WB1", "WB2", "WB3", "WB4"))
+
+
+ggplot()+
+  geom_area(data = PyroTemporal, aes(TimeMin, Watts, fill = Burn), alpha = 0.7)+
+  geom_area(data = PyroPrediction[Type == "predict"], aes(TimeMin, Watts, fill = Burn), alpha = 0.3)+
+  geom_line(data = PyroTemporal, aes(TimeMin, Watts, color = Burn), size = 0.6)+
+  geom_line(data = PyroPrediction, aes(TimeMin, Watts), color = "red", linetype = "dashed", size = 0.5)+
+  facet_wrap(~BP, nrow = 2, scales = "free")+
+  scale_fill_manual(values = c(pallette[1], pallette[4], pallette[8])) +
+  scale_color_manual(values = c(pallette[1], pallette[4], pallette[8])) +
+  scale_x_continuous(breaks = function(limits) pretty(limits, n = 4)) +
+  scale_y_continuous(expand = c(0,0), breaks = function(limits) pretty(limits, n = 5)[-1]) +
+  theme_clean(base_size = 12)+
+  theme(
+    legend.background = element_blank(),
+    legend.position = c(.9, .5),
+    panel.grid.major.y = element_line(color = "grey", linewidth = .2, linetype = "solid"),
+    panel.grid.major.x = element_line(color = "grey", linewidth = .2, linetype = "solid"),
+    legend.title = element_blank(),
+    #plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = unit(c(.5,.5,.5,.5), "cm")
+  )
+
+ggsave('Watts.pdf', last_plot(), height = 4, width = 8, units = "in", path = "/Users/leo/Desktop/MS\ project/manuscript/figures")
+```
+Consumption Plot
+```{r}
+data = ConsumptionDTAggr
+pallette = met.brewer(name = "Veronese", n = 10, type = "continuous")
+ConsumptionMed <- ConsumptionDTAggr[,median(ConsumptionMg, na.rm = TRUE), by = Burn]
+data$Burn = factor(data$Burn, levels = c("HH", "HD", "WB"))
+
+ggplot() +
+  geom_violin(data = data, aes(ConsumptionMg, Burn, fill = Burn), scale = "width", alpha = 0.7, width = .85) +
+  stat_boxplot(data = data, aes(ConsumptionMg, Burn), geom = "errorbar", width = 0.1, coef = 1, color = "black", linewidth = 1) +  
+  geom_boxplot(data = data, aes(ConsumptionMg, Burn, fill = Burn), outlier.shape = NA, coef = 1, fill = "white", color = "black", width = 0.15)+
+  geom_point(data = ConsumptionMed, aes(V1, Burn), color = "red", size = 2) +
+  scale_fill_manual(values = c(pallette[1], pallette[4], pallette[8])) +
+  scale_x_continuous(expand = c(0,0), breaks = seq(0, 500, by = 30)) +
+  coord_cartesian(xlim = c(0, 120))+
+  labs(
+    x = "Consumption (Mg/ha)"
+  ) +
+  theme_clean(base_size = 15)+
+  theme(
+    axis.title.y = element_blank(),
+    legend.background = element_blank(),
+    legend.position = c(.9, .5),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(linetype = "dotted", color = "grey"),
+    legend.title = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = unit(c(.5,.5,.5,.5), "cm")
+  )
+
+ggsave('BurnConsumptionHoriz.pdf', last_plot(), height = 2.5, width = 6, units = "in", path = "/Users/leo/Desktop/MS\ project/manuscript/figures")
+```
+ROS Plot
+```{r}
+data = RosDTAggr
+
+pallette = met.brewer(name = "Veronese", n = 10, type = "continuous")
+RosMed <- RosDT[,median(Ros, na.rm = TRUE), by = Burn]
+data$Burn = factor(data$Burn, levels = c("HH", "HD", "WB"))
+
+ggplot() +
+  geom_violin(data = data, aes(Ros, Burn, fill = Burn), scale = "width", alpha = 0.7, width = .85) +
+  stat_boxplot(data = data, aes(Ros, Burn), geom = "errorbar", width = 0.15, coef = 1, color = "black", linewidth = 1) +  
+  geom_boxplot(data = data, aes(Ros, Burn, fill = Burn), outlier.shape = NA, coef = 1, fill = "white", color = "black", width = 0.15)+
+  #geom_point(data = RosMed, aes(V1, Burn), color = "red", size = 2) +
+  scale_fill_manual(values = c(pallette[1], pallette[4], pallette[8])) +
+  scale_x_continuous(expand = c(0,0), breaks = seq(0, 4, by = 1)) +
+  coord_cartesian(xlim = c(0, 4))+
+  labs(
+    x = "Rate of spread (m/min)"
+  ) +
+  theme_clean(base_size = 15)+
+  theme(
+    axis.title.y = element_blank(),
+    legend.background = element_blank(),
+    legend.position = c(.9, .5),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(linetype = "dotted", color = "grey"),
+    legend.title = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = unit(c(.5,.5,.5,.5), "cm")
+  )
+
+ggsave('BurnRosHoriz.pdf', last_plot(), height = 2.5, width = 6, units = "in", path = "/Users/leo/Desktop/MS\ project/manuscript/figures")
+```
+ResTime Plot
+```{r}
+data = ResTimeDTAggr
+pallette = met.brewer(name = "Veronese", n = 10, type = "continuous")
+ResTimeMed <- ResTimeDT[,median(ResTimeMin), by = Burn]
+data$Burn <- factor(data$Burn, levels = c("HH", "HD", "WB"))
+
+ggplot() +
+  geom_violin(data = data, aes(ResTimeMin, Burn, fill = Burn), scale = "width", alpha = 0.7, width = .85) +
+  stat_boxplot(data = data, aes(ResTimeMin, Burn), geom = "errorbar", width = 0.15, coef = 1, color = "black", linewidth = 1) +  
+  geom_boxplot(data = data, aes(ResTimeMin, Burn, fill = Burn), outlier.shape = NA, coef = 1, fill = "white", color = "black", width = 0.15)+
+  #geom_point(data = ResTimeMed, aes(V1, Burn), color = "red", size = 2) +
+  scale_fill_manual(values = c(pallette[1], pallette[4], pallette[8])) +
+  scale_x_continuous(expand = c(0,0), breaks = seq(0, 120, by = 3)) +
+  coord_cartesian(xlim = c(0, 27))+
+  labs(
+    x = "Residence time (min)"
+  ) +
+  theme_clean(base_size = 15)+
+  theme(
+    axis.title.y = element_blank(),
+    legend.background = element_blank(),
+    legend.position = c(.9, .5),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(linetype = "dotted", color = "grey"),
+    legend.title = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = unit(c(.5,.5,.5,.5), "cm")
+  )
+
+ggsave('BurnResTimeHoriz.pdf', last_plot(), height = 2.5, width = 6, units = "in", path = "/Users/leo/Desktop/MS\ project/manuscript/figures")
+```
+Kruskal-Wallis test and Mean Rank Sums
+```{r}
+library(dunn.test)
+library(boot)
+kruskal.test(ConsumptionMg ~ Plot, data = ConsumptionDTAggr[Burn == "HD"])
+kruskal.test(Ros ~ Burn, data = RosDT)
+kruskal.test(ResTime ~ Burn, data = ResTimeDT)
+
+data <- RosDTAggr[Burn == "HH"]
+pairwise <- dunn.test(data$ConsumptionMg, data$Plot, method = "bonferroni")
+pairwise <- dunn.test(data$Ros, data$Plot, method = "bonferroni")
+pairwise <- dunn.test(ResTimeDTAggr$ResTime, ResTimeDTAggr$Burn, method = "bonferroni")
+```
+Spatial autocorrelation
+```{r}
+FRP <- raster("/Users/leo/Desktop/registration_results/FredRasters/FREDHD1.tiff")
+plot(FRP)
+print(FRP)
+mean(values(FRP, na.rm = TRUE))
+sum(values(FRP, na.rm = TRUE))*res(FRP)[1]*res(FRP)[2]/as.numeric(expanse(FRP)[2])
+
+FRP <- raster(nrows = 100, ncols = 100)
+values(FRP) <- runif(ncell(FRP))
+FRP <- focal(FRP, w=matrix(1,5,5), fun=mean)
+FRP <- aggregate(FRP, 5, fun = mean, na.rm = TRUE)
+Moran(FRP)
+
+sample_pts <- 
+sampleRandom(FRP, size = 5000, na.rm = TRUE, sp = TRUE) # Adjust the size as needed
+vgram <- variogram(lyr1~1, data=sample_pts, cutoff = 15, width = 1)
+plot(vgram)
+fit <- fit.variogram(vgram, model = vgm("Sph"))
+plot(vgram, fit, main="Fitted Variogram Model")
+
+#optimal distance = range
+aggr_factor <- ceiling(fit$range[2]/res(FRP)[2])
+res_factor <- fit$range[2]
+
+FREDAggr <- aggregate(FRED, 22, fun = mean, na.rm = TRUE)
+template <- rast(extent = FRED, resolution = 5.6)
+FREDAggr <- resample(FRED, template, method = "bilinear")
+plot(FREDAggr)
+mean(getValues(FREDAggr), na.rm = TRUE) # = 4.17
+
+Moran(raster(FREDAggr))
+mean(values(FREDAggr, na.rm = TRUE))
+sum(values(FREDAggr, na.rm = TRUE))*res(FREDAggr)[1]*res(FREDAggr)[2]/as.numeric(expanse(FREDAggr)[2])
+```
+Variogram
+```{r}
+# Original data.table
+Plots <- data.table(Burn = c("HH", "HH","HD","HD","WB","WB","WB","WB"), Plot = c(1,2,1,2,1,2,3,4))
+
+# Initialize data tables for results
+VarioPlot <- data.table(Burn = character(), Plot = numeric(), BP = character(), res_factor = numeric(), aggr_factor = numeric(), aggr_factorY = numeric(), moranAggr = numeric(), moranResa = numeric())
+
+VarioFit <- data.table(Burn = character(), Plot = numeric(), BP = character(), dist = numeric(), 
+                            gamma = numeric(), np = numeric())
+
+for (i in 1:nrow(Plots)) { 
+  r <- raster(sprintf("/Users/leo/Desktop/registration_results/FredRasters/FRED%s%s.tiff", Plots$Burn[i], Plots$Plot[i]))
+  
+  # Sample the raster
+  sample_pts <- sampleRandom(r, size = 5000, na.rm = TRUE, sp = TRUE)
+  
+  # Compute variogram
+  vgram <- variogram(lyr1~1, data=sample_pts, cutoff = 20, width = 1)
+  
+  # Fit spherical model to variogram
+  fit <- fit.variogram(vgram, model = vgm("Sph"))
+  
+  # Extract values for results
+  
+  aggr_factor <- fit$range[2]
+  aggr_factorY <- fit$psill[2]
+  res_factor <- (res(r)[2]*res(r)[1])^.5
+  rAggr <- raster::aggregate(r, 30, fun = mean, na.rm = TRUE)
+  moranAggr <- Moran(rAggr)
+  template <- rast(extent = rast(r), resolution = 4.6)
+  rAggr <- resample(rast(r), template, method = "bilinear")
+  moranResa <- Moran(raster(rAggr))
+  
+  VarioPlot <- rbind(VarioPlot, list(Plots$Burn[i], Plots$Plot[i], paste0(Plots$Burn[i], Plots$Plot[i]), res_factor, aggr_factor, aggr_factorY, moranAggr, moranResa))
+  for (j in 1:length(vgram$dist)) {
+    VarioFit <- rbind(VarioFit, list(Plots$Burn[i], Plots$Plot[i], paste0(Plots$Burn[i], Plots$Plot[i]), vgram$dist[j], vgram$gamma[j], vgram$np[j]))
+  }
+}
+
+median(VarioPlot$res_factor)
+median(VarioPlot$aggr_factor)
+```
+Variogram by plot
+```{r}
+ggplot()+
+  geom_line(data = VarioFit, aes(dist, gamma, color = Burn, group = BP), size = 1)+
+  geom_point(data = VarioPlot, aes(aggr_factor, aggr_factorY, group = BP), color = "red", size = 4)+
+  scale_color_manual(values = c(pallette[1], pallette[4], pallette[8]))+
+  facet_wrap(~Burn, ncol = 3, scales = "free")+
+  scale_x_continuous(expand = c(0,0), breaks = seq(0, 500, by = 5)) +
+  coord_cartesian(xlim = c(0, 20))+
+  theme_clean(base_size = 12)+
+  theme(
+    legend.background = element_blank(),
+    legend.position = c(.9, .5),
+    #panel.grid.major.y = element_line(color = "grey", linewidth = .2, linetype = "solid"),
+    #panel.grid.major.x = element_line(color = "grey", linewidth = .2, linetype = "solid"),
+    legend.title = element_blank(),
+    #plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = unit(c(.5,.5,.5,.5), "cm")
+  )
+  
+```
+Temporal autocorrelation stuff
+```{r}
+data <- PyroTemporal[BP == "WB4"]
+data$dummy <- rep(0,nrow(data))
+
+plot(data$TimeMin, data$Watts)
+
+coordinates(data) <- ~Time+dummy
+vgram <- variogram(Watts~1, data, width=50, cutoff = 2000)
+plot(vgram)
+fit <- fit.variogram(vgram, model = vgm("Sph"))
+plot(vgram, fit, main="Fitted Variogram Model")
+
+
+
+data <- ResTimeDTAggr[Burn == "WB"]
+
+
+fft_result <- fft(data$Watts)
+
+```
+
+
+```{r}
+# Bootstrap function
+bootstrap_mean <- function(data, size) {
+  # Sample with replacement
+  resample <- data[sample(.N, size, replace = TRUE)]
+  return(mean(resample$ResTimeMin))
+}
+
+# Number of bootstrap replications
+n_replications <- 1000
+
+# Sample sizes to test
+sample_sizes <- seq(10, nrow(data), by=10)
+
+# Store bootstrap variances
+variances <- numeric(length(sample_sizes))
+
+for (i in seq_along(sample_sizes)) {
+  bootstrap_means <- replicate(n_replications, bootstrap_mean(data, sample_sizes[i]))
+  variances[i] <- var(bootstrap_means)
+}
+
+# Plot the variances to see at which sample size the variance stabilizes
+plot(sample_sizes, variances, type='b', xlab="Sample Size", ylab="Bootstrap Variance",
+     main="Bootstrap Variance of Mean by Sample Size")
+
+library(stats)
+data <- PyroTemporal[BP == "HH2"]
+
+plot(data$Frame, data$Watts)
+
+my.w <- analyze.wavelet(data, "Watts",
+loess.span = 0,
+dt = 1, dj = 1/50,
+lowerPeriod = 2, upperPeriod = floor(nrow(data)/1),
+make.pval = TRUE, n.sim = 100)
+
+wt.image(my.w, color.key = "quantile", legend.params = list(lab = "wavelet power levels"))
+```
+Spatiotemporal FRP animation
+```{r}
+
+OutputWd <- "/Users/leo/Desktop/registration_results"
+
+
+
+save_animation <- function(rx, burn, plot) {
+  palette <- met.brewer("Tam", direction = -1)
+  frpTime <- PyroTemporal[BP == paste0(burn, plot)]
+  
+  frpStack <- rast(sprintf("/Users/leo/Desktop/registration_results/%s/plot%s/FRFD_stack%s%s.tif", burn, plot, burn, plot))
+  names(frpStack) <- rep("layer", nlyr(frpStack))
+  #template <- rast(extent = frpStack, resolution = .2)
+  #frpStackResamp <- resample(frpStack, template, method = "bilinear")
+  
+  for (i in 1:nlyr(frpStack)) {
+    time <- frpTime[Frame == i]$TimeMin
+    hours <- floor(time / 60)
+    minutes <- round(time %% 60)
+    timeString <- sprintf("%02d:%02d", hours, minutes)
+    
+    raster <- as.data.frame(frpStack[[i]], xy = TRUE)
+
+    # Create the raster plot
+    rast <- ggplot() +
+      geom_raster(data = raster, aes(x = x, y = y, fill = layer^.5), show.legend = FALSE) +
+      scale_fill_gradientn(colors = palette)+
+      annotation_scale(plot_unit = "m", width_hint = .5, pad_x = unit(0.5, "cm"), pad_y = unit(-0.5, "cm"), text_cex = 1)+
+      coord_equal(clip = "off")+
+      theme_void(base_size = 16)+
+      labs(title = paste0(rx, ": Plot", plot), subtitle = timeString)+
+      theme(
+        panel.background = element_rect(fill = palette[1], color = NA),
+        plot.margin = unit(c(0, 0, 0.5, 0), "cm"),
+        plot.title = element_text(size = 24),
+        plot.subtitle = element_text(size = 20, color = "red")
+      )
+
+    # Create the line plot
+    line <- ggplot(frpTime, aes(x = TimeMin, y = Watts)) +
+      geom_area(fill = "grey", alpha = 0.7) +
+      geom_line(color = "black", size = 0.6) +
+      geom_point(data = subset(frpTime, Frame == i), aes(x = TimeMin, y = Watts), color = "red", size = 3) +
+      theme_minimal(base_size = 16) +
+      xlab("Duration (min)")+
+      ylab(expression(FRP ~ (W ~ m^-2)))+
+      theme(legend.position = "none",
+            plot.margin = unit(c(0, 1, 0.5, 1), "cm"))
+    
+    # Combine the plots
+    combined_plot <- rast / line + plot_layout(heights = c(4, 1))
+    
+    plot(combined_plot)
+    
+    # Save the current frame
+    animation::ani.pause()  # This pauses the plot for a moment (necessary for the save)
+    
+  }
+}
+
+save_animation(Rx, Burn, Plot)
+
+Rx <- "Hanna Hammock Rx"
+Burn <- "HH"
+Plot <- 1
+
+animation::saveGIF(save_animation(Rx, Burn, Plot), movie.name = sprintf("/Users/leo/Desktop/registration_results/animated_visualization%s%s.gif", Burn, Plot), ani.width = 600, ani.height = 825, interval = 0.03, clean = TRUE)
+
+
+
+
+
+data <- as.data.frame(frpStackResamp[[170]], xy = TRUE)
+data$layerexp <- data$layer^.5
+data$layerexp[data$layerexp > 50] <- 50
+
+ggplot() +
+      geom_raster(data = data, aes(x = x, y = y, fill = layerexp), show.legend = FALSE) +
+      scale_fill_gradientn(colors = met.brewer("Tam", direction = -1), limits = c(0,50))+
+      annotation_scale(plot_unit = "m", width_hint = .5, pad_x = unit(0.5, "cm"), pad_y = unit(-0.5, "cm"), text_cex = 1)+
+      coord_equal(clip = "off")+
+      theme_void(base_size = 12)+
+      labs(title = paste0("test", 3),
+           subtitle = "minute 3")+
+      theme(
+        panel.background = element_rect(fill = met.brewer("Tam", direction = -1)[1], color = NA),
+        plot.margin = unit(c(0, 0, 0.5, 0), "cm"),
+        plot.title = element_text(size = 24),
+        plot.subtitle = element_text(size = 20, color = "red")
+      )
+
+ggplot(frpTime, aes(x = TimeMin, y = Watts)) +
+      geom_area(fill = "grey", alpha = 0.7) +
+      geom_line(color = "black", size = 0.6) +
+      geom_area(data = subset(frpTime, Frame >= 0 & Frame <= 100), aes(x = TimeMin, y = Watts), fill = "#800000", alpha = 0.7) +
+      geom_point(data = subset(frpTime, Frame == 100), aes(x = TimeMin, y = Watts), color = "black", size = 5) +
+      theme_minimal(base_size = 12) +
+      theme(legend.position = "none",
+            plot.margin = unit(c(0, 1, 0.5, 1), "cm"))
+
+Rast  / Line + plot_layout(heights = c(4, 1))
+
+
+grid.arrange(Rast, Line, nrow = 2, heights = c(3,1), padding = unit(.5, "cm"))
+```
+
+
+#import the data
+```{r}
+error_pt <- as.data.frame(read.csv("/Users/leo/Desktop/registration_results/RmseErrorData/error_Stabilization.csv"))
+
+error_geo <- as.data.frame(read.csv("/Users/leo/Desktop/registration_results/RmseErrorData/GeoRMSE.csv"))
+
+pallette = met.brewer(name = "Demuth", n = 9, type = "discrete")
+print(pallette)
+```
+
+Boxplot
+```{r}
+ggplot(data = error_pt, aes(x = model, y = error, fill = mask)) +
+  geom_boxplot() +
+#  geom_point(position = position_jitterdodge(jitter.width=0.1), alpha = 0.4)+
+scale_y_continuous(expand = c(0,0), limits = c(0, 25), breaks = seq(0, 25, by = 5)) +
+  scale_fill_manual(values = c("#9b332b", "#5d6174", "#AE7810"), name = "fire mask")+
+  ylab("shift (pixels)")+
+ theme_clean(base_size = 12)+
+  theme(
+    legend.background = element_blank(),
+    legend.position = c(.9, .5),
+    #legend.justification = c("left", "bottom"),
+    legend.title = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = unit(c(.5,.5,.5,.5), "cm")
+  )
+
+ggsave("ErrorBoxPlot.pdf", last_plot(), path = "/Users/leo/Desktop/MS\ project/manuscript/figures", height = 5, width = 5)
+```
+
+
